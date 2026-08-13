@@ -1,6 +1,8 @@
 package com.kijm.gui;
 
 import ij.ImagePlus;
+import ij.gui.Roi;
+import ij.gui.RoiListener;
 import ij.gui.StackWindow;
 import ij.gui.Toolbar;
 import java.awt.*;
@@ -10,7 +12,6 @@ import javax.swing.JPanel;
 import javax.swing.SwingUtilities;
 
 public class ImageJVideoPanel extends JPanel {
-    private ImagePlus currentImp;
     private StackWindow currentWin;
     private final SwingImageCanvas canvasPanel = new SwingImageCanvas();
     private final JPanel controlContainer = new JPanel(new BorderLayout());
@@ -21,18 +22,23 @@ public class ImageJVideoPanel extends JPanel {
         this.add(controlContainer, BorderLayout.SOUTH);
 
         ImagePlus.addImageListener(new ij.ImageListener() {
-            @Override
-            public void imageUpdated(ImagePlus imp) {
-                if (imp == currentImp) canvasPanel.repaint(); 
-            }
+            @Override public void imageUpdated(ImagePlus imp) { if (canvasPanel.isCurrent(imp)) canvasPanel.repaint(); }
             @Override public void imageOpened(ImagePlus imp) {}
             @Override public void imageClosed(ImagePlus imp) {}
+        });
+
+        Roi.addRoiListener(new RoiListener() {
+            @Override
+            public void roiModified(ImagePlus imp, int id) {
+                if (canvasPanel.isCurrent(imp)) {
+                    canvasPanel.repaint();
+                }
+            }
         });
     }
 
     public void displayVideo(ImagePlus imp, String fullPath) {
         closeCurrentVideo();
-        this.currentImp = imp;
         if (imp == null) { canvasPanel.setTargetImage(null); return; }
 
         Component movieControls = null;
@@ -48,14 +54,13 @@ public class ImageJVideoPanel extends JPanel {
             movieControls.setPreferredSize(new Dimension(imp.getWidth(), 80));
             controlContainer.add(movieControls, BorderLayout.CENTER);
         }
-        this.revalidate(); 
-        this.repaint();
+        this.revalidate(); this.repaint();
         SwingUtilities.invokeLater(() -> canvasPanel.fitToPanelSize());
     }
 
     public void closeCurrentVideo() {
         if (this.currentWin != null) { this.currentWin.close(); this.currentWin = null; }
-        this.currentImp = null;
+        canvasPanel.setTargetImage(null);
     }
 
     private Component extractMovieControls(StackWindow win) {
@@ -75,18 +80,12 @@ public class ImageJVideoPanel extends JPanel {
         public SwingImageCanvas() {
             this.setBackground(Color.DARK_GRAY);
 
-            this.addMouseWheelListener(new MouseWheelListener() {
-                @Override
-                public void mouseWheelMoved(MouseWheelEvent e) {
-                    if (imp == null) return;
-                    int rotation = e.getWheelRotation(); 
-                    if (imp.getStackSize() > 1) {
-                        int nextFrame = imp.getCurrentSlice() - rotation;                             
-                        if (nextFrame < 1) nextFrame = 1;
-                        if (nextFrame > imp.getStackSize()) nextFrame = imp.getStackSize();                                                    
-                        imp.setSlice(nextFrame);
-                    }
-                }
+            this.addMouseWheelListener(e -> {
+                if (imp == null) return;
+                int rotation = e.getWheelRotation();
+
+                if (imp.getStackSize() > 1) 
+                    imp.setSlice(Math.max(1, Math.min(imp.getCurrentSlice() - rotation, imp.getStackSize())));
             });
 
             this.addMouseListener(new MouseAdapter() {
@@ -97,21 +96,16 @@ public class ImageJVideoPanel extends JPanel {
                     boolean isLeft = SwingUtilities.isLeftMouseButton(e);
                     boolean isRight = SwingUtilities.isRightMouseButton(e);
 
-                    if (e.isShiftDown()) {
-                        fitToPanelSize();
-                        return;
-                    }
+                    if (e.isShiftDown()) { fitToPanelSize(); return; }
 
                     double oldZoom = zoom;
-                    if (isLeft)  zoom *= 1.2; 
-                    else if (isRight)  zoom /= 1.2;                     
+                    if      (isLeft)  zoom *= 1.2;
+                    else if (isRight) zoom /= 1.2;
                     zoom = Math.max(0.1, Math.min(zoom, 32.0));
 
                     if (zoom != oldZoom) {
-                        double absX = srcX + (e.getX() / oldZoom);
-                        double absY = srcY + (e.getY() / oldZoom);
-                        srcX = absX - (e.getX() / zoom);
-                        srcY = absY - (e.getY() / zoom);
+                        srcX = (srcX + (e.getX() / oldZoom)) - (e.getX() / zoom);
+                        srcY = (srcY + (e.getY() / oldZoom)) - (e.getY() / zoom);
                     }
                     repaint();
                 }
@@ -124,7 +118,9 @@ public class ImageJVideoPanel extends JPanel {
             repaint();
         }
 
-        private void fitToPanelSize() {
+        public boolean isCurrent(ImagePlus checkImp) { return this.imp == checkImp; }
+
+        public void fitToPanelSize() {
             if (imp == null || imp.getProcessor() == null) return;
             double imgW = imp.getProcessor().getWidth(), imgH = imp.getProcessor().getHeight();
             if (getWidth() <= 0 || getHeight() <= 0) return;
@@ -149,18 +145,42 @@ public class ImageJVideoPanel extends JPanel {
             }
             if (cachedImg == null) return;
 
+            int panelW = getWidth();
+            int panelH = getHeight();
+
             if (isFirstPaint) {
-                srcX = (cachedImg.getWidth() - getWidth()) / 2.0;
-                srcY = (cachedImg.getHeight() - getHeight()) / 2.0;
+                srcX = (cachedImg.getWidth() - panelW) / 2.0;
+                srcY = (cachedImg.getHeight() - panelH) / 2.0;
                 isFirstPaint = false;
             }
 
             Graphics2D g2d = (Graphics2D) g.create();
             g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
             
-            g2d.drawImage(cachedImg, 0, 0, getWidth(), getHeight(), 
-                          (int)Math.round(srcX), (int)Math.round(srcY), 
-                          (int)Math.round(srcX + (getWidth() / zoom)), (int)Math.round(srcY + (getHeight() / zoom)), null);
+            int srcX1 = (int)Math.round(srcX);
+            int srcY1 = (int)Math.round(srcY);
+            int srcX2 = (int)Math.round(srcX + (panelW / zoom));
+            int srcY2 = (int)Math.round(srcY + (panelH / zoom));
+            
+            g2d.drawImage(cachedImg, 0, 0, panelW, panelH, srcX1, srcY1, srcX2, srcY2, null);
+
+            Roi roi = imp.getRoi(); 
+            if (roi != null) {
+                g2d.setColor(Roi.getColor() != null ? Roi.getColor() : Color.YELLOW);
+                
+                Rectangle r = roi.getBounds();
+                
+                int scrX = (int) Math.round((r.x - srcX) * zoom);
+                int scrY = (int) Math.round((r.y - srcY) * zoom);
+                int scrW = (int) Math.round(r.width * zoom);
+                int scrH = (int) Math.round(r.height * zoom);
+                
+                g2d.setStroke(new BasicStroke(1.5f));
+                
+                if (roi.getType() == Roi.OVAL) { g2d.drawOval(scrX, scrY, scrW, scrH);} 
+                else { g2d.drawRect(scrX, scrY, scrW, scrH);}
+            }
+            
             g2d.dispose();
         }
     }
